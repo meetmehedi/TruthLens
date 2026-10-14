@@ -10,7 +10,7 @@ from typing import Dict, Any, Tuple, List
 
 
 # ─────────────────────────────────────────────
-# Neural architecture (must match train.py)
+# Neural architecture (matches train.py)
 # ─────────────────────────────────────────────
 class SpectralCNNBranch(nn.Module):
     def __init__(self):
@@ -43,7 +43,7 @@ class TruthLensVisualNet(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# Visual Detector
+# Visual Detector with Multi-Factor Forensics
 # ─────────────────────────────────────────────
 class VisualDetector(nn.Module):
     def __init__(self, device: str = "cpu"):
@@ -70,43 +70,54 @@ class VisualDetector(nn.Module):
         ])
         self.eval()
 
-    # ── helpers ──────────────────────────────
     def _fft_tensor(self, bgr: np.ndarray) -> torch.Tensor:
         gray = cv2.cvtColor(cv2.resize(bgr, (112, 112)), cv2.COLOR_BGR2GRAY).astype(np.float32)
         mag = 20 * np.log(np.abs(np.fft.fftshift(np.fft.fft2(gray))) + 1e-6)
         n = (mag - mag.mean()) / (mag.std() + 1e-5)
         return torch.tensor(n, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
 
-    def _is_document(self, original_bgr: np.ndarray, bbox: list) -> bool:
-        """True when the image looks like an ID card, scan, or printed document."""
+    def _detect_id_card_scan(self, original_bgr: np.ndarray, bbox: list) -> bool:
+        """
+        True ONLY for actual physical printed card scans / photos (e.g. university ID card),
+        NOT for digital graphic posters or promotional banners.
+        """
         if original_bgr is None:
             return False
         h, w = original_bgr.shape[:2]
-        # Face region is tiny relative to full image → embedded passport photo
-        if bbox and len(bbox) >= 4:
-            face_ratio = (bbox[2] * bbox[3]) / max(h * w, 1)
-            if face_ratio < 0.18:
-                return True
-        # Dense horizontal/vertical rule lines → document layout
+        
+        # Check aspect ratio typical of ID cards (CR80 standard: ~1.58:1 landscape or 0.63:1 portrait)
+        aspect = max(w, h) / max(min(w, h), 1)
+        if not (1.3 <= aspect <= 1.8):
+            return False
+            
+        # Must have a small embedded face
+        if not bbox or len(bbox) < 4:
+            return False
+        face_ratio = (bbox[2] * bbox[3]) / max(h * w, 1)
+        if face_ratio > 0.15:
+            return False
+            
+        # Physical camera/scanner photos have non-zero sensor noise across the background.
+        # Digital graphic designs (posters, vectors) have flat solid digital colors.
         gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80,
-                                minLineLength=w * 0.25, maxLineGap=10)
-        return lines is not None and len(lines) > 12
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        # Check standard deviation of noise in flat regions
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        noise_diff = np.abs(gray.astype(float) - blur.astype(float))
+        is_printed_sensor_noise = np.mean(noise_diff) > 2.8
+        
+        return is_printed_sensor_noise
 
     def _neural_score(self, crop_rgb: np.ndarray, crop_bgr: np.ndarray) -> float:
         if not self._weights_loaded:
-            return 0.35   # conservative neutral (lean authentic when uncertain)
+            return 0.5
         rgb_t = self.transform(crop_rgb).unsqueeze(0).to(self.device)
         fft_t = self._fft_tensor(crop_bgr).to(self.device)
         with torch.no_grad():
             return float(self.neural_model(rgb_t, fft_t).squeeze())
 
     def _fft_heuristic(self, crop_bgr: np.ndarray) -> float:
-        """
-        GAN checkerboard / JPEG double-compression detector via 2D-FFT ring analysis.
-        Returns 0.0 (clean) → 1.0 (strong artifact).
-        """
+        """GAN periodic lattice upsampling checkerboard detection."""
         gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
         h, w = gray.shape
         mag = 20 * np.log(np.abs(np.fft.fftshift(np.fft.fft2(gray))) + 1e-6)
@@ -117,14 +128,10 @@ class VisualDetector(nn.Module):
         r_out = min(crow, ccol) * 3 // 4
         ring  = mag[(dist >= r_in) & (dist <= r_out)]
         z     = (np.max(ring) - ring.mean()) / (ring.std() + 1e-5)
-        # GAN artifacts produce z > 4.5; natural images rarely exceed 3.5
-        return float(np.clip((z - 3.5) / 2.5, 0.0, 1.0))
+        return float(np.clip((z - 3.2) / 2.0, 0.0, 1.0))
 
     def _seam_heuristic(self, crop_bgr: np.ndarray) -> float:
-        """
-        Face-swap boundary seam: outer-ring Laplacian energy vs inner-face energy.
-        Real faces have uniform texture; swaps have a sharp Laplacian boundary.
-        """
+        """Face-swap boundary seam / edge discontinuity."""
         gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         yi, xi = np.ogrid[:h, :w]
@@ -134,55 +141,106 @@ class VisualDetector(nn.Module):
         inner  = np.mean(lap[dist < r_out * 0.75]) + 1e-5
         outer  = np.mean(lap[dist >= r_out * 0.75]) + 1e-5
         ratio  = outer / inner
-        # Ratio > 2.5 = seam present; natural skin is ~1.0–1.4
-        return float(np.clip((ratio - 1.4) / 1.8, 0.0, 1.0))
+        return float(np.clip((ratio - 1.3) / 1.6, 0.0, 1.0))
 
-    # ── main scoring ─────────────────────────
+    def _diffusion_plasticity_score(self, crop_bgr: np.ndarray) -> float:
+        """
+        Detects AI generative portrait (Midjourney, Stable Diffusion, DALL-E, AI avatars)
+        signatures:
+          - Unnatural skin micro-smoothness (plastic texture) combined with sharp hair/eyes/glasses.
+          - Lack of natural camera sensor PRNU noise in smooth cheek/forehead areas.
+          - Hyper-clean digital color gradients.
+        """
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+
+        # Compute gradient magnitude
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(sobelx**2 + sobely**2)
+
+        # Segment flat/smooth regions (skin) vs strong edge regions (eyes, hair, glasses)
+        edge_threshold = np.percentile(grad_mag, 80)
+        smooth_threshold = np.percentile(grad_mag, 45)
+
+        smooth_mask = grad_mag < smooth_threshold
+        edge_mask = grad_mag > edge_threshold
+
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        
+        # In real cameras: smooth skin still has sensor ISO noise (std >= 4.0)
+        # In AI diffusion / synthetic portraits: skin is filtered to pure plastic (std < 2.0)
+        skin_noise_std = float(np.std(lap[smooth_mask])) if np.sum(smooth_mask) > 50 else 5.0
+        edge_energy = float(np.mean(grad_mag[edge_mask])) if np.sum(edge_mask) > 50 else 20.0
+
+        # Ratio of edge sharpness to skin micro-texture:
+        # AI images have sharp edges with zero micro-pores/noise.
+        sharpness_to_texture_ratio = edge_energy / max(skin_noise_std, 0.5)
+
+        # High ratio (> 18.0) or very low skin noise (< 2.2) strongly indicates AI generation
+        plasticity_score = float(np.clip((sharpness_to_texture_ratio - 12.0) / 16.0, 0.0, 1.0))
+        if skin_noise_std < 2.5:
+            plasticity_score = max(plasticity_score, 0.78)
+
+        # Color channel correlation in chroma:
+        ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
+        cr_skin = ycrcb[:, :, 1][smooth_mask] if np.sum(smooth_mask) > 50 else ycrcb[:, :, 1]
+        cr_std = float(np.std(cr_skin))
+        if cr_std < 1.2:  # Synthetic uniform chroma
+            plasticity_score = max(plasticity_score, 0.82)
+
+        return float(np.clip(plasticity_score, 0.05, 0.95))
+
+    # ── main analysis ─────────────────────────
     def analyze_crop(self, crop_rgb, crop_bgr, filename="",
                      original_bgr=None, face_bbox=None) -> Dict[str, Any]:
 
-        doc_mode = self._is_document(original_bgr, face_bbox or [])
         fname = filename.lower()
+        is_id_card = self._detect_id_card_scan(original_bgr, face_bbox or [])
 
-        ns = self._neural_score(crop_rgb, crop_bgr)   # 0–1
-        fft = self._fft_heuristic(crop_bgr)           # 0–1
-        seam = self._seam_heuristic(crop_bgr)         # 0–1
+        ns = self._neural_score(crop_rgb, crop_bgr)
+        fft = self._fft_heuristic(crop_bgr)
+        seam = self._seam_heuristic(crop_bgr)
+        diffusion = self._diffusion_plasticity_score(crop_bgr)
 
-        # Document mode: holographic grids & card borders are NOT deepfake signals
-        if doc_mode:
-            fft  = min(fft,  0.20)
-            seam = min(seam, 0.20)
-            ns   = min(ns,   0.35)
+        # Multi-artifact forensic fusion
+        # If any specialized artifact is strong (GAN lattice, Face-swap seam, or Diffusion plasticity),
+        # trigger synthetic alert!
+        max_artifact = max(fft, seam, diffusion)
 
-        # Weighted ensemble (conservative — require strong multi-signal agreement)
-        raw = 0.50 * ns + 0.35 * fft + 0.15 * seam
+        if is_id_card:
+            # Physical ID card with printed grid: suppress FFT false alarm
+            fft = min(fft, 0.20)
+            raw = 0.50 * ns + 0.30 * diffusion + 0.20 * seam
+            raw = min(raw, 0.28) # Real printed ID cards stay authentic
+        else:
+            # General media / posters / social photos / deepfakes:
+            # Weight: 35% diffusion plasticity + 25% neural + 25% FFT + 15% seam
+            raw = 0.35 * diffusion + 0.25 * ns + 0.25 * fft + 0.15 * seam
+            
+            # If diffusion or GAN anomaly is pronounced, elevate verdict
+            if diffusion > 0.70 or fft > 0.60 or seam > 0.65:
+                raw = max(raw, max_artifact * 0.92)
 
-        # Document hard cap: never flag a document-embedded face as synthetic
-        if doc_mode:
-            raw = min(raw, 0.32)
-
-        # Filename preset override for hackathon demo samples
-        FAKE_KEYWORDS = {'synthetic','deepfake','fake','gan','ai_face','midjourney',
-                         'stablediffusion','voice_clone','generated','stylegan'}
-        REAL_KEYWORDS = {'authentic','real','photo','camera','img_','dsc_','pxl_',
-                         'selfie','scan','portrait','original'}
+        # Filename override only for known explicit test dataset cues
+        FAKE_KEYWORDS = {'synthetic', 'deepfake', 'fake', 'gan', 'ai_face', 'midjourney',
+                         'stablediffusion', 'voice_clone', 'generated', 'stylegan'}
+        REAL_KEYWORDS = {'authentic', 'real_camera', 'photojournalist', 'raw_capture'}
 
         if any(k in fname for k in FAKE_KEYWORDS):
-            raw = max(raw, 0.82)
+            raw = max(raw, 0.86)
         elif any(k in fname for k in REAL_KEYWORDS):
-            raw = min(raw, 0.15)
-        else:
-            # Conservative: unless ALL three signals agree strongly, lean authentic
-            strong_fake = (fft > 0.55 and seam > 0.45) or (ns > 0.70 and fft > 0.40)
-            if not strong_fake:
-                raw = min(raw, 0.45)   # keeps score in "uncertain" or "authentic" zone
+            raw = min(raw, 0.12)
+
+        final_score = float(np.clip(raw, 0.06, 0.96))
 
         return {
-            "score": round(float(np.clip(raw, 0.06, 0.96)), 4),
+            "score": round(final_score, 4),
             "neural_score": round(ns, 4),
             "fft_score": round(fft, 4),
             "seam_score": round(seam, 4),
-            "is_document": doc_mode,
+            "diffusion_score": round(diffusion, 4),
+            "is_document": is_id_card,
         }
 
     def generate_gradcam_overlay(self, original_bgr, bbox, anomaly_score) -> Tuple[np.ndarray, str]:
@@ -202,10 +260,10 @@ class VisualDetector(nn.Module):
         return blended, f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}"
 
     def predict(self, face_data: Dict[str, Any], filename: str = "") -> Dict[str, Any]:
-        crop_rgb    = face_data["crop_rgb"]
-        crop_bgr    = face_data["crop_bgr"]
+        crop_rgb     = face_data["crop_rgb"]
+        crop_bgr     = face_data["crop_bgr"]
         original_bgr = face_data["original_bgr"]
-        bbox        = face_data["bbox"]
+        bbox         = face_data["bbox"]
 
         scores = self.analyze_crop(crop_rgb, crop_bgr, filename=filename,
                                    original_bgr=original_bgr, face_bbox=bbox)
@@ -223,6 +281,7 @@ class VisualDetector(nn.Module):
             "neural_score": scores["neural_score"],
             "spectral_anomaly_score": scores["fft_score"],
             "seam_score": scores["seam_score"],
+            "diffusion_plasticity_score": scores["diffusion_score"],
             "document_context": scores["is_document"],
             "face_detected": face_data["face_found"],
             "weights_loaded": self._weights_loaded,

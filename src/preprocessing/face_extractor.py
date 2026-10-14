@@ -25,9 +25,9 @@ class FaceExtractor:
         gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
         faces = self.face_cascade.detectMultiScale(
             gray,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(40, 40)
+            scaleFactor=1.05,
+            minNeighbors=3,
+            minSize=(25, 25)
         )
         return [tuple(f) for f in faces]
 
