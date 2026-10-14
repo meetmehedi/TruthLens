@@ -139,12 +139,52 @@ class VisualDetector(nn.Module):
         _, buffer = cv2.imencode(".jpg", blended, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return blended, f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
 
-    def analyze_crop(self, crop_rgb: np.ndarray, crop_bgr: np.ndarray, filename: str = "") -> Dict[str, Any]:
+    def _detect_document_context(self, original_bgr: np.ndarray, face_bbox: list) -> bool:
+        """
+        Detects if the input is a document scan / ID card / printed photo
+        rather than a real-world selfie or live camera capture.
+        Documents with printed faces cause false FFT positives because:
+          - Security holographic grids look like GAN upsampling lattices
+          - Printed halftone dots create periodic spectral spikes
+          - The face occupies a small embedded region in a structured card
+        Returns True if document context is likely.
+        """
+        h, w, _ = original_bgr.shape
+        image_area = h * w
+
+        # If the detected face is very small relative to image (< 18% of area),
+        # the face is embedded in a larger document / card background.
+        if face_bbox and len(face_bbox) >= 4:
+            bw, bh = face_bbox[2], face_bbox[3]
+            face_area = bw * bh
+            face_ratio = face_area / max(image_area, 1)
+            if face_ratio < 0.18:
+                return True
+
+        # High density of structured text lines → document
+        gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80,
+                                minLineLength=w * 0.25, maxLineGap=10)
+        if lines is not None and len(lines) > 12:
+            return True
+
+        return False
+
+    def analyze_crop(self, crop_rgb: np.ndarray, crop_bgr: np.ndarray,
+                     filename: str = "", original_bgr: np.ndarray = None,
+                     face_bbox: list = None) -> Dict[str, Any]:
         """
         Runs the trained dual-stream neural network + auxiliary heuristics.
+        Applies document-mode suppression for ID cards and printed photos.
         Returns a final calibrated forensic score.
         """
         fname_lower = filename.lower()
+
+        # --- DOCUMENT / ID CARD CONTEXT DETECTION ---
+        is_document = False
+        if original_bgr is not None:
+            is_document = self._detect_document_context(original_bgr, face_bbox or [])
 
         # --- TRAINED NEURAL NETWORK INFERENCE ---
         if self._weights_loaded:
@@ -169,8 +209,21 @@ class VisualDetector(nn.Module):
         outer_mean = np.mean(laplacian[dist >= r_outer * 0.75]) + 1e-5
         seam_score = float(np.clip(abs(outer_mean / inner_mean - 1.0) * 0.7, 0.05, 0.90))
 
+        # --- DOCUMENT MODE: Suppress FFT false positives from printed grids / holograms ---
+        if is_document:
+            # For documents, rely primarily on the neural network face crop (ignoring grid FFT)
+            # and reduce seam sensitivity (printed cards have natural edge contrast)
+            fft_score = min(fft_score, 0.30)
+            seam_score = min(seam_score, 0.25)
+            # Reduce neural score weight — neural model trained on real faces, not printed ones
+            neural_score = min(neural_score, 0.40)
+
         # --- ENSEMBLE: 55% neural + 30% FFT + 15% seam ---
         raw_score = 0.55 * neural_score + 0.30 * fft_score + 0.15 * seam_score
+
+        # Document context: authenticity bias for embedded printed photos
+        if is_document:
+            raw_score = min(raw_score, 0.35)
 
         # Filename-based preset calibration for demo presets
         if any(k in fname_lower for k in ['synthetic', 'deepfake', 'fake', 'gan', 'ai_face',
@@ -180,16 +233,18 @@ class VisualDetector(nn.Module):
                                              'img_', 'dsc_', 'pxl_', 'selfie']):
             raw_score = min(0.14, raw_score * 0.4)
         else:
-            if fft_score < 0.35 and seam_score < 0.35 and neural_score < 0.35:
-                raw_score = min(0.18, raw_score * 0.50)
-            elif fft_score > 0.65 or seam_score > 0.65 or neural_score > 0.65:
-                raw_score = max(0.75, raw_score)
+            if not is_document:
+                if fft_score < 0.35 and seam_score < 0.35 and neural_score < 0.35:
+                    raw_score = min(0.18, raw_score * 0.50)
+                elif fft_score > 0.65 or seam_score > 0.65 or neural_score > 0.65:
+                    raw_score = max(0.75, raw_score)
 
         final_score = float(np.clip(raw_score, 0.06, 0.96))
         return {
             "score": round(final_score, 4),
             "spatial_score": round(neural_score, 4),
-            "fft_score": round(fft_score, 4)
+            "fft_score": round(fft_score, 4),
+            "is_document": is_document
         }
 
     def predict(self, face_data: Dict[str, Any], filename: str = "") -> Dict[str, Any]:
@@ -199,7 +254,8 @@ class VisualDetector(nn.Module):
         original_bgr = face_data["original_bgr"]
         bbox = face_data["bbox"]
 
-        scores = self.analyze_crop(crop_rgb, crop_bgr, filename=filename)
+        scores = self.analyze_crop(crop_rgb, crop_bgr, filename=filename,
+                                    original_bgr=original_bgr, face_bbox=bbox)
         score = scores["score"]
 
         _, overlay_b64 = self.generate_gradcam_overlay(original_bgr, bbox, score)
@@ -215,6 +271,7 @@ class VisualDetector(nn.Module):
             "spatial_score": scores["spatial_score"],
             "spectral_anomaly_score": scores["fft_score"],
             "face_detected": face_data["face_found"],
+            "document_context": scores.get("is_document", False),
             "weights_loaded": self._weights_loaded,
             "overlay_image_base64": overlay_b64,
             "original_image_base64": orig_b64,
