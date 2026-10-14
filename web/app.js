@@ -216,11 +216,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // 1. Verdict & Badge
     verdictBanner.className = 'card glass-card verdict-banner';
     verdictBadge.className = 'verdict-badge';
-    if (data.verdict === 'Likely Synthetic') {
+    if (data.verdict.includes('Synthetic') || data.verdict.includes('Deepfake')) {
       verdictBanner.classList.add('verdict-synthetic');
       verdictBadge.classList.add('badge-synthetic');
       verdictBadge.textContent = 'Likely Synthetic / Deepfake';
-    } else if (data.verdict === 'Authentic') {
+    } else if (data.verdict.includes('Authentic')) {
       verdictBanner.classList.add('verdict-authentic');
       verdictBadge.classList.add('badge-authentic');
       verdictBadge.textContent = 'Authentic / Genuine';

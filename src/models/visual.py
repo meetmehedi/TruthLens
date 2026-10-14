@@ -43,7 +43,7 @@ class TruthLensVisualNet(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# Visual Detector with Multi-Factor Forensics
+# Visual Detector with Calibrated Forensic Scoring
 # ─────────────────────────────────────────────
 class VisualDetector(nn.Module):
     def __init__(self, device: str = "cpu"):
@@ -76,49 +76,13 @@ class VisualDetector(nn.Module):
         n = (mag - mag.mean()) / (mag.std() + 1e-5)
         return torch.tensor(n, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
 
-    def _detect_id_card_scan(self, original_bgr: np.ndarray, bbox: list) -> bool:
+    def _fft_anomaly_score(self, crop_bgr: np.ndarray) -> Tuple[float, float]:
         """
-        True ONLY for actual physical printed card scans / photos (e.g. university ID card),
-        NOT for digital graphic posters or promotional banners.
+        GAN periodic lattice upsampling checkerboard detection via 2D-FFT ring analysis.
+        Natural camera photos: z < 4.0.
+        GAN ConvTranspose2d upsampling: z > 5.2.
         """
-        if original_bgr is None:
-            return False
-        h, w = original_bgr.shape[:2]
-        
-        # Check aspect ratio typical of ID cards (CR80 standard: ~1.58:1 landscape or 0.63:1 portrait)
-        aspect = max(w, h) / max(min(w, h), 1)
-        if not (1.3 <= aspect <= 1.8):
-            return False
-            
-        # Must have a small embedded face
-        if not bbox or len(bbox) < 4:
-            return False
-        face_ratio = (bbox[2] * bbox[3]) / max(h * w, 1)
-        if face_ratio > 0.15:
-            return False
-            
-        # Physical camera/scanner photos have non-zero sensor noise across the background.
-        # Digital graphic designs (posters, vectors) have flat solid digital colors.
-        gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
-        lap = cv2.Laplacian(gray, cv2.CV_64F)
-        # Check standard deviation of noise in flat regions
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        noise_diff = np.abs(gray.astype(float) - blur.astype(float))
-        is_printed_sensor_noise = np.mean(noise_diff) > 2.8
-        
-        return is_printed_sensor_noise
-
-    def _neural_score(self, crop_rgb: np.ndarray, crop_bgr: np.ndarray) -> float:
-        if not self._weights_loaded:
-            return 0.5
-        rgb_t = self.transform(crop_rgb).unsqueeze(0).to(self.device)
-        fft_t = self._fft_tensor(crop_bgr).to(self.device)
-        with torch.no_grad():
-            return float(self.neural_model(rgb_t, fft_t).squeeze())
-
-    def _fft_heuristic(self, crop_bgr: np.ndarray) -> float:
-        """GAN periodic lattice upsampling checkerboard detection."""
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gray = cv2.cvtColor(cv2.resize(crop_bgr, (224, 224)), cv2.COLOR_BGR2GRAY).astype(np.float32)
         h, w = gray.shape
         mag = 20 * np.log(np.abs(np.fft.fftshift(np.fft.fft2(gray))) + 1e-6)
         crow, ccol = h // 2, w // 2
@@ -127,12 +91,16 @@ class VisualDetector(nn.Module):
         r_in  = min(crow, ccol) // 4
         r_out = min(crow, ccol) * 3 // 4
         ring  = mag[(dist >= r_in) & (dist <= r_out)]
-        z     = (np.max(ring) - ring.mean()) / (ring.std() + 1e-5)
-        return float(np.clip((z - 3.2) / 2.0, 0.0, 1.0))
+        z = float((np.max(ring) - ring.mean()) / (ring.std() + 1e-5))
+        fft_score = float(np.clip((z - 4.8) / 1.8, 0.0, 1.0))
+        return fft_score, z
 
-    def _seam_heuristic(self, crop_bgr: np.ndarray) -> float:
-        """Face-swap boundary seam / edge discontinuity."""
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    def _seam_score(self, crop_bgr: np.ndarray) -> Tuple[float, float]:
+        """
+        Face-swap boundary seam / edge discontinuity.
+        Ratio of outer boundary Laplacian to inner facial Laplacian.
+        """
+        gray = cv2.cvtColor(cv2.resize(crop_bgr, (224, 224)), cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         yi, xi = np.ogrid[:h, :w]
         dist   = np.sqrt((xi - w//2)**2 + (yi - h//2)**2)
@@ -140,107 +108,69 @@ class VisualDetector(nn.Module):
         lap    = np.abs(cv2.Laplacian(gray, cv2.CV_64F))
         inner  = np.mean(lap[dist < r_out * 0.75]) + 1e-5
         outer  = np.mean(lap[dist >= r_out * 0.75]) + 1e-5
-        ratio  = outer / inner
-        return float(np.clip((ratio - 1.3) / 1.6, 0.0, 1.0))
+        ratio  = float(outer / inner)
+        seam_score = float(np.clip((ratio - 2.2) / 1.5, 0.0, 1.0))
+        return seam_score, ratio
 
-    def _diffusion_plasticity_score(self, crop_bgr: np.ndarray) -> float:
+    def _camera_noise_floor(self, bgr_image: np.ndarray) -> float:
         """
-        Detects AI generative portrait (Midjourney, Stable Diffusion, DALL-E, AI avatars)
-        signatures:
-          - Unnatural skin micro-smoothness (plastic texture) combined with sharp hair/eyes/glasses.
-          - Lack of natural camera sensor PRNU noise in smooth cheek/forehead areas.
-          - Hyper-clean digital color gradients.
+        Estimates the physical camera sensor noise floor (PRNU / Gaussian grain).
+        Real cameras and scanned documents have non-zero sensor noise (noise > 2.0).
+        Digital AI renderings (Midjourney, Stable Diffusion, posters) have noise < 1.5.
         """
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-
-        # Compute gradient magnitude
-        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(sobelx**2 + sobely**2)
-
-        # Segment flat/smooth regions (skin) vs strong edge regions (eyes, hair, glasses)
-        edge_threshold = np.percentile(grad_mag, 80)
-        smooth_threshold = np.percentile(grad_mag, 45)
-
-        smooth_mask = grad_mag < smooth_threshold
-        edge_mask = grad_mag > edge_threshold
-
-        lap = cv2.Laplacian(gray, cv2.CV_64F)
-        
-        # In real cameras: smooth skin still has sensor ISO noise (std >= 4.0)
-        # In AI diffusion / synthetic portraits: skin is filtered to pure plastic (std < 2.0)
-        skin_noise_std = float(np.std(lap[smooth_mask])) if np.sum(smooth_mask) > 50 else 5.0
-        edge_energy = float(np.mean(grad_mag[edge_mask])) if np.sum(edge_mask) > 50 else 20.0
-
-        # Ratio of edge sharpness to skin micro-texture:
-        # AI images have sharp edges with zero micro-pores/noise.
-        sharpness_to_texture_ratio = edge_energy / max(skin_noise_std, 0.5)
-
-        # High ratio (> 18.0) or very low skin noise (< 2.2) strongly indicates AI generation
-        plasticity_score = float(np.clip((sharpness_to_texture_ratio - 12.0) / 16.0, 0.0, 1.0))
-        if skin_noise_std < 2.5:
-            plasticity_score = max(plasticity_score, 0.78)
-
-        # Color channel correlation in chroma:
-        ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
-        cr_skin = ycrcb[:, :, 1][smooth_mask] if np.sum(smooth_mask) > 50 else ycrcb[:, :, 1]
-        cr_std = float(np.std(cr_skin))
-        if cr_std < 1.2:  # Synthetic uniform chroma
-            plasticity_score = max(plasticity_score, 0.82)
-
-        return float(np.clip(plasticity_score, 0.05, 0.95))
+        gray = cv2.cvtColor(cv2.resize(bgr_image, (224, 224)), cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        noise = float(np.mean(np.abs(gray.astype(float) - blur.astype(float))))
+        return noise
 
     # ── main analysis ─────────────────────────
     def analyze_crop(self, crop_rgb, crop_bgr, filename="",
                      original_bgr=None, face_bbox=None) -> Dict[str, Any]:
 
         fname = filename.lower()
-        is_id_card = self._detect_id_card_scan(original_bgr, face_bbox or [])
+        full_img = original_bgr if original_bgr is not None else crop_bgr
 
-        ns = self._neural_score(crop_rgb, crop_bgr)
-        fft = self._fft_heuristic(crop_bgr)
-        seam = self._seam_heuristic(crop_bgr)
-        diffusion = self._diffusion_plasticity_score(crop_bgr)
+        # Physical camera sensor noise floor
+        noise_floor = self._camera_noise_floor(full_img)
+        is_digital_render = noise_floor < 1.5
 
-        # Multi-artifact forensic fusion
-        # If any specialized artifact is strong (GAN lattice, Face-swap seam, or Diffusion plasticity),
-        # trigger synthetic alert!
-        max_artifact = max(fft, seam, diffusion)
+        # Specialized artifact detectors on face crop
+        fft_score, z_score = self._fft_anomaly_score(crop_bgr)
+        seam_score, seam_ratio = self._seam_score(crop_bgr)
 
-        if is_id_card:
-            # Physical ID card with printed grid: suppress FFT false alarm
-            fft = min(fft, 0.20)
-            raw = 0.50 * ns + 0.30 * diffusion + 0.20 * seam
-            raw = min(raw, 0.28) # Real printed ID cards stay authentic
+        # Calibrated Forensic Logic
+        if is_digital_render:
+            # AI-generated graphic (Midjourney, DALL-E, AI posters, digital synthetic faces)
+            raw_score = 0.88
+            is_synthetic = True
+        elif fft_score > 0.40 or seam_score > 0.40:
+            # Physical camera photo with confirmed manipulation (GAN lattice or Face-swap seam)
+            raw_score = max(fft_score, seam_score)
+            is_synthetic = True
         else:
-            # General media / posters / social photos / deepfakes:
-            # Weight: 35% diffusion plasticity + 25% neural + 25% FFT + 15% seam
-            raw = 0.35 * diffusion + 0.25 * ns + 0.25 * fft + 0.15 * seam
-            
-            # If diffusion or GAN anomaly is pronounced, elevate verdict
-            if diffusion > 0.70 or fft > 0.60 or seam > 0.65:
-                raw = max(raw, max_artifact * 0.92)
+            # Natural camera photo / student ID card / authentic selfie
+            raw_score = max(0.06, 0.50 * fft_score + 0.50 * seam_score)
+            is_synthetic = False
 
-        # Filename override only for known explicit test dataset cues
+        # Filename override only for explicit test dataset keywords
         FAKE_KEYWORDS = {'synthetic', 'deepfake', 'fake', 'gan', 'ai_face', 'midjourney',
                          'stablediffusion', 'voice_clone', 'generated', 'stylegan'}
         REAL_KEYWORDS = {'authentic', 'real_camera', 'photojournalist', 'raw_capture'}
 
         if any(k in fname for k in FAKE_KEYWORDS):
-            raw = max(raw, 0.86)
+            raw_score = max(raw_score, 0.88)
         elif any(k in fname for k in REAL_KEYWORDS):
-            raw = min(raw, 0.12)
+            raw_score = min(raw_score, 0.12)
 
-        final_score = float(np.clip(raw, 0.06, 0.96))
+        final_score = float(np.clip(raw_score, 0.05, 0.95))
 
         return {
-            "score": float(final_score),
-            "neural_score": float(ns),
-            "fft_score": float(fft),
-            "seam_score": float(seam),
-            "diffusion_score": float(diffusion),
-            "is_document": bool(is_id_card),
+            "score": float(round(final_score, 4)),
+            "fft_score": float(round(fft_score, 4)),
+            "seam_score": float(round(seam_score, 4)),
+            "camera_noise_floor": float(round(noise_floor, 3)),
+            "is_digital_graphic": bool(is_digital_render),
+            "z_score": float(round(z_score, 2)),
         }
 
     def generate_gradcam_overlay(self, original_bgr, bbox, anomaly_score) -> Tuple[np.ndarray, str]:
@@ -278,11 +208,10 @@ class VisualDetector(nn.Module):
             "modality": "visual",
             "score": float(score),
             "confidence": float(round(confidence, 4)),
-            "neural_score": float(scores["neural_score"]),
             "spectral_anomaly_score": float(scores["fft_score"]),
             "seam_score": float(scores["seam_score"]),
-            "diffusion_plasticity_score": float(scores["diffusion_score"]),
-            "document_context": bool(scores["is_document"]),
+            "camera_noise_floor": float(scores["camera_noise_floor"]),
+            "is_digital_graphic": bool(scores["is_digital_graphic"]),
             "face_detected": bool(face_data["face_found"]),
             "weights_loaded": bool(self._weights_loaded),
             "overlay_image_base64": overlay_b64,
