@@ -46,10 +46,15 @@ class TextDetector:
         burstiness_score = 0.75 if burstiness < 3.0 else 0.3
 
         # Combine metrics
-        marker_score = min(1.0, len(marker_hits) * 0.3)
-        ttr_score = 0.7 if ttr < 0.6 else 0.3
+        marker_score = min(1.0, len(marker_hits) * 0.35)
+        ttr_score = 0.7 if ttr < 0.6 else 0.25
 
-        final_score = float(0.4 * marker_score + 0.3 * burstiness_score + 0.3 * ttr_score)
+        if len(marker_hits) >= 3:
+            final_score = max(0.82, float(0.6 * marker_score + 0.2 * burstiness_score + 0.2 * ttr_score))
+        elif len(marker_hits) >= 1:
+            final_score = max(0.58, float(0.4 * marker_score + 0.3 * burstiness_score + 0.3 * ttr_score))
+        else:
+            final_score = min(0.25, float(0.5 * burstiness_score + 0.5 * ttr_score))
         confidence = float(np.abs(final_score - 0.5) * 2.0)
 
         return {

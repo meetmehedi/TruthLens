@@ -138,18 +138,28 @@ class VisualDetector(nn.Module):
         fft_score, z_score = self._fft_anomaly_score(crop_bgr)
         seam_score, seam_ratio = self._seam_score(crop_bgr)
 
-        # Calibrated Forensic Logic
+        # 1. Dual-Stream Neural Model Inference (Spatial MobileNetV2 + Spectral 2D-FFT CNN)
+        try:
+            rgb_224 = cv2.resize(crop_rgb, (224, 224))
+            rgb_t = self.transform(rgb_224).unsqueeze(0).to(self.device)
+            fft_t = self._fft_tensor(crop_bgr).to(self.device)
+            with torch.no_grad():
+                neural_score = float(self.neural_model(rgb_t, fft_t).item())
+        except Exception:
+            neural_score = 0.50
+
+        # 2. Calibrated Allied Decision Logic
         if is_digital_render:
             # AI-generated graphic (Midjourney, DALL-E, AI posters, digital synthetic faces)
             raw_score = 0.88
             is_synthetic = True
-        elif fft_score > 0.40 or seam_score > 0.40:
-            # Physical camera photo with confirmed manipulation (GAN lattice or Face-swap seam)
-            raw_score = max(fft_score, seam_score)
+        elif neural_score > 0.50 or fft_score > 0.40 or seam_score > 0.40:
+            # Confirmed deepfake (Neural feature detection, GAN lattice, or Face-swap seam)
+            raw_score = max(neural_score, fft_score, seam_score)
             is_synthetic = True
         else:
-            # Natural camera photo / student ID card / authentic selfie
-            raw_score = max(0.06, 0.50 * fft_score + 0.50 * seam_score)
+            # Genuine camera photo / student ID card / authentic selfie
+            raw_score = max(0.06, 0.60 * neural_score + 0.20 * fft_score + 0.20 * seam_score)
             is_synthetic = False
 
         # Filename override only for explicit test dataset keywords

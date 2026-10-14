@@ -97,9 +97,11 @@ class AudioDetector:
         # Conservative ensemble — require both neural AND harmonic agreement
         raw = 0.50 * ns + 0.35 * harm + 0.15 * cutoff
 
-        # Only push into synthetic zone if signals strongly agree
-        if not (ns > 0.65 and harm > 0.60):
-            raw = min(raw, 0.50)   # stay uncertain unless very sure
+        # Push into synthetic zone if harmonic rigidity or neural vocoder anomaly is detected
+        if harm > 0.70 or ns > 0.60:
+            raw = max(raw, 0.82)
+        elif harm < 0.35 and ns < 0.40:
+            raw = min(raw, 0.25)
 
         raw = float(np.clip(raw, 0.06, 0.96))
         confidence = float(raw if raw > 0.5 else (1.0 - raw))
