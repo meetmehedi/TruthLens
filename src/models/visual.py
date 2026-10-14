@@ -235,12 +235,12 @@ class VisualDetector(nn.Module):
         final_score = float(np.clip(raw, 0.06, 0.96))
 
         return {
-            "score": round(final_score, 4),
-            "neural_score": round(ns, 4),
-            "fft_score": round(fft, 4),
-            "seam_score": round(seam, 4),
-            "diffusion_score": round(diffusion, 4),
-            "is_document": is_id_card,
+            "score": float(final_score),
+            "neural_score": float(ns),
+            "fft_score": float(fft),
+            "seam_score": float(seam),
+            "diffusion_score": float(diffusion),
+            "is_document": bool(is_id_card),
         }
 
     def generate_gradcam_overlay(self, original_bgr, bbox, anomaly_score) -> Tuple[np.ndarray, str]:
@@ -276,15 +276,15 @@ class VisualDetector(nn.Module):
 
         return {
             "modality": "visual",
-            "score": score,
-            "confidence": round(confidence, 4),
-            "neural_score": scores["neural_score"],
-            "spectral_anomaly_score": scores["fft_score"],
-            "seam_score": scores["seam_score"],
-            "diffusion_plasticity_score": scores["diffusion_score"],
-            "document_context": scores["is_document"],
-            "face_detected": face_data["face_found"],
-            "weights_loaded": self._weights_loaded,
+            "score": float(score),
+            "confidence": float(round(confidence, 4)),
+            "neural_score": float(scores["neural_score"]),
+            "spectral_anomaly_score": float(scores["fft_score"]),
+            "seam_score": float(scores["seam_score"]),
+            "diffusion_plasticity_score": float(scores["diffusion_score"]),
+            "document_context": bool(scores["is_document"]),
+            "face_detected": bool(face_data["face_found"]),
+            "weights_loaded": bool(self._weights_loaded),
             "overlay_image_base64": overlay_b64,
             "original_image_base64": orig_b64,
             "bbox": [int(v) for v in bbox] if bbox else None,

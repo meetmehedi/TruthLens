@@ -51,6 +51,20 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 if os.path.exists(WEB_DIR):
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
+# Helper to sanitize any numpy or non-primitive objects recursively
+def sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return [sanitize_for_json(item) for item in obj]
+    elif hasattr(obj, "item"):  # numpy scalar
+        return obj.item()
+    elif isinstance(obj, (int, float, str, bool)) or obj is None:
+        return obj
+    return str(obj)
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     index_file = os.path.join(WEB_DIR, "index.html")
@@ -160,7 +174,7 @@ async def analyze_media(
 
         latency_sec = round(time.time() - start_time, 2)
 
-        return {
+        response_payload = {
             "status": "success",
             "analysis_id": analysis_id,
             "filename": filename,
@@ -179,6 +193,7 @@ async def analyze_media(
             "audio_branch": audio_result,
             "text_branch": text_result
         }
+        return JSONResponse(content=sanitize_for_json(response_payload))
 
     finally:
         # Clean up temporary uploaded file to preserve disk space and ensure user privacy
