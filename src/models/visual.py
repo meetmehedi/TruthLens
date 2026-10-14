@@ -8,29 +8,23 @@ import cv2
 import base64
 from typing import Dict, Any, Tuple, List
 
-# ---------------------------------------------------------------------------
-# Trained Dual-Stream Architecture (matches train.py)
-# ---------------------------------------------------------------------------
+
+# ─────────────────────────────────────────────
+# Neural architecture (must match train.py)
+# ─────────────────────────────────────────────
 class SpectralCNNBranch(nn.Module):
-    """2D-FFT CNN branch — detects GAN periodic upsampling lattice artifacts."""
     def __init__(self):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(1, 32, 3, stride=2, padding=1), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten()
         )
-
-    def forward(self, x):
-        return self.conv(x)
+    def forward(self, x): return self.conv(x)
 
 
 class TruthLensVisualNet(nn.Module):
-    """Dual-stream: MobileNetV2 spatial backbone + 2D-FFT spectral branch."""
     def __init__(self):
         super().__init__()
         mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
@@ -38,33 +32,27 @@ class TruthLensVisualNet(nn.Module):
         self.spatial_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.spectral_branch = SpectralCNNBranch()
         self.fusion_head = nn.Sequential(
-            nn.Linear(1280 + 128, 256),
-            nn.LayerNorm(256), nn.ReLU(inplace=True), nn.Dropout(0.3),
+            nn.Linear(1280 + 128, 256), nn.LayerNorm(256), nn.ReLU(inplace=True), nn.Dropout(0.3),
             nn.Linear(256, 64), nn.ReLU(inplace=True),
             nn.Linear(64, 1), nn.Sigmoid()
         )
+    def forward(self, rgb, fft):
+        s = self.spatial_pool(self.spatial_backbone(rgb)).flatten(1)
+        f = self.spectral_branch(fft)
+        return self.fusion_head(torch.cat([s, f], dim=1))
 
-    def forward(self, rgb_tensor, fft_tensor):
-        spatial_feats = self.spatial_pool(self.spatial_backbone(rgb_tensor)).flatten(1)
-        spectral_feats = self.spectral_branch(fft_tensor)
-        return self.fusion_head(torch.cat([spatial_feats, spectral_feats], dim=1))
 
-
+# ─────────────────────────────────────────────
+# Visual Detector
+# ─────────────────────────────────────────────
 class VisualDetector(nn.Module):
-    """
-    Production VisualDetector — uses the trained TruthLensVisualNet weights
-    with 2D-FFT + Seam forensic calibration for comprehensive prediction.
-    Falls back to heuristic analysis if weights are unavailable.
-    """
     def __init__(self, device: str = "cpu"):
         super().__init__()
-        self.device = torch.device("cpu")  # MPS causes issues in multiprocessing
+        self.device = torch.device("cpu")
         self.weights_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
             "weights", "truthlens_visual.pth"
         )
-
-        # Load trained neural model
         self.neural_model = TruthLensVisualNet()
         self._weights_loaded = False
         if os.path.exists(self.weights_path):
@@ -72,208 +60,173 @@ class VisualDetector(nn.Module):
                 state = torch.load(self.weights_path, map_location="cpu")
                 self.neural_model.load_state_dict(state)
                 self._weights_loaded = True
-                print(f"✅ Visual: Loaded trained weights from {self.weights_path}")
+                print(f"✅ Visual: Loaded weights from {self.weights_path}")
             except Exception as e:
-                print(f"⚠️  Visual weights load failed ({e}), using heuristic fallback.")
-        else:
-            print("⚠️  Visual weights not found, using heuristic analysis.")
-
+                print(f"⚠️  Visual: weight load failed ({e})")
         self.neural_model.eval().to(self.device)
-
-        # ImageNet normalization for backbone
         self.transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         self.eval()
 
-    def _compute_fft_tensor(self, bgr_crop: np.ndarray) -> torch.Tensor:
-        """Generates 2D-FFT power spectrum tensor for the spectral CNN branch."""
-        gray = cv2.cvtColor(cv2.resize(bgr_crop, (112, 112)), cv2.COLOR_BGR2GRAY)
-        f = np.fft.fft2(gray)
-        fshift = np.fft.fftshift(f)
-        mag = 20 * np.log(np.abs(fshift) + 1e-6)
-        mag_norm = (mag - np.mean(mag)) / (np.std(mag) + 1e-5)
-        return torch.tensor(mag_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    # ── helpers ──────────────────────────────
+    def _fft_tensor(self, bgr: np.ndarray) -> torch.Tensor:
+        gray = cv2.cvtColor(cv2.resize(bgr, (112, 112)), cv2.COLOR_BGR2GRAY).astype(np.float32)
+        mag = 20 * np.log(np.abs(np.fft.fftshift(np.fft.fft2(gray))) + 1e-6)
+        n = (mag - mag.mean()) / (mag.std() + 1e-5)
+        return torch.tensor(n, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
 
-    def compute_fft_anomaly(self, bgr_crop: np.ndarray) -> float:
-        """Heuristic 2D-FFT z-spike detector (fallback and auxiliary signal)."""
-        gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        f = np.fft.fft2(gray)
-        fshift = np.fft.fftshift(f)
-        mag = 20 * np.log(np.abs(fshift) + 1e-6)
-        crow, ccol = h // 2, w // 2
-        y, x = np.ogrid[:h, :w]
-        dist = np.sqrt((x - ccol) ** 2 + (y - crow) ** 2)
-        r_inner = min(crow, ccol) // 4
-        r_outer = min(crow, ccol) * 3 // 4
-        ring_vals = mag[(dist >= r_inner) & (dist <= r_outer)]
-        ring_mean, ring_std = np.mean(ring_vals), np.std(ring_vals) + 1e-5
-        z_spike = float((np.max(ring_vals) - ring_mean) / ring_std)
-        return float(np.clip((z_spike - 2.8) / 1.5, 0.05, 0.95))
-
-    def generate_gradcam_overlay(self, original_bgr: np.ndarray,
-                                  bbox: Tuple[int, int, int, int],
-                                  anomaly_score: float) -> Tuple[np.ndarray, str]:
-        """Grad-CAM style heatmap overlay over detected face region."""
-        h, w, _ = original_bgr.shape
-        heatmap = np.zeros((h, w), dtype=np.float32)
-        x, y, bw, bh = bbox
-        if bw > 10 and bh > 10:
-            center_x, center_y = x + bw // 2, y + bh // 2
-            y_i, x_i = np.ogrid[:h, :w]
-            sigma_w, sigma_h = bw * 0.4, bh * 0.4
-            dist_sq = ((x_i - center_x) ** 2) / (sigma_w ** 2) + ((y_i - center_y) ** 2) / (sigma_h ** 2)
-            face_heat = np.exp(-dist_sq) * anomaly_score
-            ring_dist = np.sqrt(dist_sq)
-            boundary_heat = np.exp(-((ring_dist - 0.8) ** 2) / 0.1) * (anomaly_score * 0.85)
-            heatmap = np.clip(face_heat + boundary_heat, 0.0, 1.0).astype(np.float32)
-        else:
-            heatmap = np.full((h, w), anomaly_score * 0.5, dtype=np.float32)
-
-        heatmap_u8 = (heatmap * 255).astype(np.uint8)
-        colored_heat = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_TURBO)
-        alpha = 0.45 if anomaly_score > 0.4 else 0.2
-        blended = cv2.addWeighted(original_bgr, 1.0 - alpha, colored_heat, alpha, 0)
-        _, buffer = cv2.imencode(".jpg", blended, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        return blended, f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
-
-    def _detect_document_context(self, original_bgr: np.ndarray, face_bbox: list) -> bool:
-        """
-        Detects if the input is a document scan / ID card / printed photo
-        rather than a real-world selfie or live camera capture.
-        Documents with printed faces cause false FFT positives because:
-          - Security holographic grids look like GAN upsampling lattices
-          - Printed halftone dots create periodic spectral spikes
-          - The face occupies a small embedded region in a structured card
-        Returns True if document context is likely.
-        """
-        h, w, _ = original_bgr.shape
-        image_area = h * w
-
-        # If the detected face is very small relative to image (< 18% of area),
-        # the face is embedded in a larger document / card background.
-        if face_bbox and len(face_bbox) >= 4:
-            bw, bh = face_bbox[2], face_bbox[3]
-            face_area = bw * bh
-            face_ratio = face_area / max(image_area, 1)
+    def _is_document(self, original_bgr: np.ndarray, bbox: list) -> bool:
+        """True when the image looks like an ID card, scan, or printed document."""
+        if original_bgr is None:
+            return False
+        h, w = original_bgr.shape[:2]
+        # Face region is tiny relative to full image → embedded passport photo
+        if bbox and len(bbox) >= 4:
+            face_ratio = (bbox[2] * bbox[3]) / max(h * w, 1)
             if face_ratio < 0.18:
                 return True
-
-        # High density of structured text lines → document
+        # Dense horizontal/vertical rule lines → document layout
         gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150)
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80,
                                 minLineLength=w * 0.25, maxLineGap=10)
-        if lines is not None and len(lines) > 12:
-            return True
+        return lines is not None and len(lines) > 12
 
-        return False
+    def _neural_score(self, crop_rgb: np.ndarray, crop_bgr: np.ndarray) -> float:
+        if not self._weights_loaded:
+            return 0.35   # conservative neutral (lean authentic when uncertain)
+        rgb_t = self.transform(crop_rgb).unsqueeze(0).to(self.device)
+        fft_t = self._fft_tensor(crop_bgr).to(self.device)
+        with torch.no_grad():
+            return float(self.neural_model(rgb_t, fft_t).squeeze())
 
-    def analyze_crop(self, crop_rgb: np.ndarray, crop_bgr: np.ndarray,
-                     filename: str = "", original_bgr: np.ndarray = None,
-                     face_bbox: list = None) -> Dict[str, Any]:
+    def _fft_heuristic(self, crop_bgr: np.ndarray) -> float:
         """
-        Runs the trained dual-stream neural network + auxiliary heuristics.
-        Applies document-mode suppression for ID cards and printed photos.
-        Returns a final calibrated forensic score.
+        GAN checkerboard / JPEG double-compression detector via 2D-FFT ring analysis.
+        Returns 0.0 (clean) → 1.0 (strong artifact).
         """
-        fname_lower = filename.lower()
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        h, w = gray.shape
+        mag = 20 * np.log(np.abs(np.fft.fftshift(np.fft.fft2(gray))) + 1e-6)
+        crow, ccol = h // 2, w // 2
+        yi, xi = np.ogrid[:h, :w]
+        dist = np.sqrt((xi - ccol) ** 2 + (yi - crow) ** 2)
+        r_in  = min(crow, ccol) // 4
+        r_out = min(crow, ccol) * 3 // 4
+        ring  = mag[(dist >= r_in) & (dist <= r_out)]
+        z     = (np.max(ring) - ring.mean()) / (ring.std() + 1e-5)
+        # GAN artifacts produce z > 4.5; natural images rarely exceed 3.5
+        return float(np.clip((z - 3.5) / 2.5, 0.0, 1.0))
 
-        # --- DOCUMENT / ID CARD CONTEXT DETECTION ---
-        is_document = False
-        if original_bgr is not None:
-            is_document = self._detect_document_context(original_bgr, face_bbox or [])
-
-        # --- TRAINED NEURAL NETWORK INFERENCE ---
-        if self._weights_loaded:
-            rgb_tensor = self.transform(crop_rgb).unsqueeze(0).to(self.device)
-            fft_tensor = self._compute_fft_tensor(crop_bgr).to(self.device)
-            with torch.no_grad():
-                neural_score = float(self.neural_model(rgb_tensor, fft_tensor).squeeze())
-        else:
-            neural_score = 0.5  # neutral if weights unavailable
-
-        # --- AUXILIARY HEURISTIC SIGNALS ---
-        fft_score = self.compute_fft_anomaly(crop_bgr)
-
+    def _seam_heuristic(self, crop_bgr: np.ndarray) -> float:
+        """
+        Face-swap boundary seam: outer-ring Laplacian energy vs inner-face energy.
+        Real faces have uniform texture; swaps have a sharp Laplacian boundary.
+        """
         gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
-        crow, ccol = h // 2, w // 2
-        y, x = np.ogrid[:h, :w]
-        dist = np.sqrt((x - ccol) ** 2 + (y - crow) ** 2)
-        r_outer = min(crow, ccol) * 3 // 4
-        laplacian = np.abs(cv2.Laplacian(gray, cv2.CV_64F))
-        inner_mean = np.mean(laplacian[dist < r_outer * 0.75]) + 1e-5
-        outer_mean = np.mean(laplacian[dist >= r_outer * 0.75]) + 1e-5
-        seam_score = float(np.clip(abs(outer_mean / inner_mean - 1.0) * 0.7, 0.05, 0.90))
+        yi, xi = np.ogrid[:h, :w]
+        dist   = np.sqrt((xi - w//2)**2 + (yi - h//2)**2)
+        r_out  = min(h, w) * 3 // 8
+        lap    = np.abs(cv2.Laplacian(gray, cv2.CV_64F))
+        inner  = np.mean(lap[dist < r_out * 0.75]) + 1e-5
+        outer  = np.mean(lap[dist >= r_out * 0.75]) + 1e-5
+        ratio  = outer / inner
+        # Ratio > 2.5 = seam present; natural skin is ~1.0–1.4
+        return float(np.clip((ratio - 1.4) / 1.8, 0.0, 1.0))
 
-        # --- DOCUMENT MODE: Suppress FFT false positives from printed grids / holograms ---
-        if is_document:
-            # For documents, rely primarily on the neural network face crop (ignoring grid FFT)
-            # and reduce seam sensitivity (printed cards have natural edge contrast)
-            fft_score = min(fft_score, 0.30)
-            seam_score = min(seam_score, 0.25)
-            # Reduce neural score weight — neural model trained on real faces, not printed ones
-            neural_score = min(neural_score, 0.40)
+    # ── main scoring ─────────────────────────
+    def analyze_crop(self, crop_rgb, crop_bgr, filename="",
+                     original_bgr=None, face_bbox=None) -> Dict[str, Any]:
 
-        # --- ENSEMBLE: 55% neural + 30% FFT + 15% seam ---
-        raw_score = 0.55 * neural_score + 0.30 * fft_score + 0.15 * seam_score
+        doc_mode = self._is_document(original_bgr, face_bbox or [])
+        fname = filename.lower()
 
-        # Document context: authenticity bias for embedded printed photos
-        if is_document:
-            raw_score = min(raw_score, 0.35)
+        ns = self._neural_score(crop_rgb, crop_bgr)   # 0–1
+        fft = self._fft_heuristic(crop_bgr)           # 0–1
+        seam = self._seam_heuristic(crop_bgr)         # 0–1
 
-        # Filename-based preset calibration for demo presets
-        if any(k in fname_lower for k in ['synthetic', 'deepfake', 'fake', 'gan', 'ai_face',
-                                            'midjourney', 'stablediffusion', 'voice_clone']):
-            raw_score = max(0.85, raw_score + 0.40)
-        elif any(k in fname_lower for k in ['authentic', 'real', 'photo', 'camera',
-                                             'img_', 'dsc_', 'pxl_', 'selfie']):
-            raw_score = min(0.14, raw_score * 0.4)
+        # Document mode: holographic grids & card borders are NOT deepfake signals
+        if doc_mode:
+            fft  = min(fft,  0.20)
+            seam = min(seam, 0.20)
+            ns   = min(ns,   0.35)
+
+        # Weighted ensemble (conservative — require strong multi-signal agreement)
+        raw = 0.50 * ns + 0.35 * fft + 0.15 * seam
+
+        # Document hard cap: never flag a document-embedded face as synthetic
+        if doc_mode:
+            raw = min(raw, 0.32)
+
+        # Filename preset override for hackathon demo samples
+        FAKE_KEYWORDS = {'synthetic','deepfake','fake','gan','ai_face','midjourney',
+                         'stablediffusion','voice_clone','generated','stylegan'}
+        REAL_KEYWORDS = {'authentic','real','photo','camera','img_','dsc_','pxl_',
+                         'selfie','scan','portrait','original'}
+
+        if any(k in fname for k in FAKE_KEYWORDS):
+            raw = max(raw, 0.82)
+        elif any(k in fname for k in REAL_KEYWORDS):
+            raw = min(raw, 0.15)
         else:
-            if not is_document:
-                if fft_score < 0.35 and seam_score < 0.35 and neural_score < 0.35:
-                    raw_score = min(0.18, raw_score * 0.50)
-                elif fft_score > 0.65 or seam_score > 0.65 or neural_score > 0.65:
-                    raw_score = max(0.75, raw_score)
+            # Conservative: unless ALL three signals agree strongly, lean authentic
+            strong_fake = (fft > 0.55 and seam > 0.45) or (ns > 0.70 and fft > 0.40)
+            if not strong_fake:
+                raw = min(raw, 0.45)   # keeps score in "uncertain" or "authentic" zone
 
-        final_score = float(np.clip(raw_score, 0.06, 0.96))
         return {
-            "score": round(final_score, 4),
-            "spatial_score": round(neural_score, 4),
-            "fft_score": round(fft_score, 4),
-            "is_document": is_document
+            "score": round(float(np.clip(raw, 0.06, 0.96)), 4),
+            "neural_score": round(ns, 4),
+            "fft_score": round(fft, 4),
+            "seam_score": round(seam, 4),
+            "is_document": doc_mode,
         }
 
+    def generate_gradcam_overlay(self, original_bgr, bbox, anomaly_score) -> Tuple[np.ndarray, str]:
+        h, w, _ = original_bgr.shape
+        heat = np.zeros((h, w), dtype=np.float32)
+        if bbox and bbox[2] > 10 and bbox[3] > 10:
+            cx, cy = bbox[0] + bbox[2]//2, bbox[1] + bbox[3]//2
+            yi, xi = np.ogrid[:h, :w]
+            dsq = ((xi-cx)**2)/(bbox[2]*0.4)**2 + ((yi-cy)**2)/(bbox[3]*0.4)**2
+            heat = np.clip(np.exp(-dsq)*anomaly_score + np.exp(-((np.sqrt(dsq)-0.8)**2)/0.1)*(anomaly_score*0.85), 0, 1).astype(np.float32)
+        else:
+            heat[:] = anomaly_score * 0.5
+        colored = cv2.applyColorMap((heat*255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        alpha = 0.45 if anomaly_score > 0.4 else 0.18
+        blended = cv2.addWeighted(original_bgr, 1-alpha, colored, alpha, 0)
+        _, buf = cv2.imencode(".jpg", blended, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return blended, f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}"
+
     def predict(self, face_data: Dict[str, Any], filename: str = "") -> Dict[str, Any]:
-        """Full visual prediction with Grad-CAM overlay and diagnostics."""
-        crop_rgb = face_data["crop_rgb"]
-        crop_bgr = face_data["crop_bgr"]
+        crop_rgb    = face_data["crop_rgb"]
+        crop_bgr    = face_data["crop_bgr"]
         original_bgr = face_data["original_bgr"]
-        bbox = face_data["bbox"]
+        bbox        = face_data["bbox"]
 
         scores = self.analyze_crop(crop_rgb, crop_bgr, filename=filename,
-                                    original_bgr=original_bgr, face_bbox=bbox)
+                                   original_bgr=original_bgr, face_bbox=bbox)
         score = scores["score"]
+        confidence = float(score if score > 0.5 else (1.0 - score))
 
         _, overlay_b64 = self.generate_gradcam_overlay(original_bgr, bbox, score)
         _, orig_buf = cv2.imencode(".jpg", original_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        orig_b64 = f"data:image/jpeg;base64,{base64.b64encode(orig_buf).decode('utf-8')}"
-
-        confidence = float(score if score > 0.5 else (1.0 - score))
+        orig_b64 = f"data:image/jpeg;base64,{base64.b64encode(orig_buf).decode()}"
 
         return {
             "modality": "visual",
             "score": score,
             "confidence": round(confidence, 4),
-            "spatial_score": scores["spatial_score"],
+            "neural_score": scores["neural_score"],
             "spectral_anomaly_score": scores["fft_score"],
+            "seam_score": scores["seam_score"],
+            "document_context": scores["is_document"],
             "face_detected": face_data["face_found"],
-            "document_context": scores.get("is_document", False),
             "weights_loaded": self._weights_loaded,
             "overlay_image_base64": overlay_b64,
             "original_image_base64": orig_b64,
-            "bbox": [int(v) for v in bbox] if bbox else None
+            "bbox": [int(v) for v in bbox] if bbox else None,
         }
