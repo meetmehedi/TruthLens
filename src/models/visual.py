@@ -1,4 +1,5 @@
 import os
+import pickle
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -57,10 +58,14 @@ class VisualDetector(nn.Module):
     def __init__(self, device: str = "cpu"):
         super().__init__()
         self.device = torch.device("cpu")
-        self.weights_path = os.path.join(
+        weights_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "weights", "truthlens_visual.pth"
+            "weights"
         )
+        self.weights_path = os.path.join(weights_dir, "truthlens_visual.pth")
+        self.pkl_path = os.path.join(weights_dir, "truthlens_visual_classifier.pkl")
+
+        # Load PyTorch deep neural backbone
         self.neural_model = TruthLensVisualNet()
         self._weights_loaded = False
         if os.path.exists(self.weights_path):
@@ -68,13 +73,26 @@ class VisualDetector(nn.Module):
                 state = torch.load(self.weights_path, map_location="cpu", weights_only=True)
                 missing, unexpected = self.neural_model.load_state_dict(state, strict=False)
                 self._weights_loaded = True
-                if missing or unexpected:
-                    print(f"⚠️  Visual: Partial weight load ({len(missing)} missing, {len(unexpected)} unexpected) — rule-based detection active")
-                else:
-                    print(f"✅ Visual: Loaded weights from {self.weights_path}")
+                print(f"✅ Visual: Loaded PyTorch weights from {self.weights_path}")
             except Exception as e:
-                print(f"⚠️  Visual: weight load failed ({e}) — rule-based detection active")
+                print(f"⚠️  Visual: PyTorch weight load failed ({e})")
         self.neural_model.eval().to(self.device)
+
+        # Load Calibrated ML Pipeline (.pkl)
+        self.ml_classifier = None
+        self.scaler = None
+        self.feature_names = []
+        if os.path.exists(self.pkl_path):
+            try:
+                with open(self.pkl_path, "rb") as f:
+                    pkg = pickle.load(f)
+                self.ml_classifier = pkg["model"]
+                self.scaler = pkg["scaler"]
+                self.feature_names = pkg.get("feature_names", [])
+                print(f"✅ Visual: Loaded trained ML pipeline (.pkl) from {self.pkl_path}")
+            except Exception as e:
+                print(f"⚠️  Visual: Failed to load .pkl model ({e})")
+
         self.transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -207,6 +225,114 @@ class VisualDetector(nn.Module):
         # Normalize: std < 8 → score ≈ 1.0; std > 40 → score ≈ 0.0
         return float(np.clip((40 - bg_std) / 32, 0.0, 1.0))
 
+    def _extract_feature_vector(self, crop_bgr: np.ndarray, full_img: np.ndarray, face_bbox=None) -> list:
+        h, w, _ = full_img.shape
+        if max(h, w) > 1024:
+            scale = 1024.0 / max(h, w)
+            proc = cv2.resize(full_img, (int(w * scale), int(h * scale)))
+        else:
+            proc = full_img
+        gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
+
+        # 1. PRNU Sensor Noise via median residual
+        den = cv2.medianBlur(gray, 3)
+        res = np.abs(gray.astype(float) - den.astype(float))
+        noise_mean = float(np.mean(res))
+        noise_std = float(np.std(res))
+        noise_skew = float(np.mean(((res - noise_mean) / (noise_std + 1e-5)) ** 3))
+
+        step = 32
+        stds = []
+        for r in range(0, min(gray.shape[0], 512) - step, step):
+            for c in range(0, min(gray.shape[1], 512) - step, step):
+                stds.append(np.std(gray[r:r+step, c:c+step]))
+        patch_min = float(np.min(stds)) if stds else 0.0
+        patch_med = float(np.median(stds)) if stds else 0.0
+
+        b, g, r_chan = cv2.split(proc.astype(float))
+        db = b - cv2.medianBlur(b.astype(np.uint8), 3).astype(float)
+        dg = g - cv2.medianBlur(g.astype(np.uint8), 3).astype(float)
+        dr = r_chan - cv2.medianBlur(r_chan.astype(np.uint8), 3).astype(float)
+        corr_rb = float(np.corrcoef(dr.flatten(), db.flatten())[0, 1]) if np.std(dr) > 1e-4 and np.std(db) > 1e-4 else 0.0
+        corr_rg = float(np.corrcoef(dr.flatten(), dg.flatten())[0, 1]) if np.std(dr) > 1e-4 and np.std(dg) > 1e-4 else 0.0
+
+        # 2. 2D FFT Frequency analysis
+        gray_224 = cv2.cvtColor(cv2.resize(proc, (224, 224)), cv2.COLOR_BGR2GRAY).astype(float)
+        dft = np.fft.fftshift(np.fft.fft2(gray_224))
+        mag = np.abs(dft)
+        cy, cx = 112, 112
+        yi, xi = np.ogrid[:224, :224]
+        dist = np.sqrt((xi - cx) ** 2 + (yi - cy) ** 2)
+
+        ring = mag[(dist >= 28) & (dist <= 84)]
+        fft_z = float((np.max(ring) - ring.mean()) / (ring.std() + 1e-5))
+        fft_hf = float(np.sum(mag[dist > 78]) / (np.sum(mag) + 1e-9))
+
+        tot_mag = np.sum(mag) + 1e-9
+        oct1 = float(np.sum(mag[dist < 28]) / tot_mag)
+        oct2 = float(np.sum(mag[(dist >= 28) & (dist < 56)]) / tot_mag)
+        oct3 = float(np.sum(mag[(dist >= 56) & (dist < 84)]) / tot_mag)
+        oct4 = float(np.sum(mag[dist >= 84]) / tot_mag)
+
+        # 3. Edge, geometry & document features
+        edges = cv2.Canny(cv2.resize(gray, (320, 320)), 50, 150)
+        edge_dens = float(np.mean(edges > 0))
+
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        sobel_r = float(np.mean(np.abs(gy)) / (np.mean(np.abs(gx)) + 1e-5))
+        lap_var = float(np.var(cv2.Laplacian(gray, cv2.CV_64F)))
+
+        border = 25
+        bg_px = np.concatenate([
+            gray_224[:border, :].flatten(),
+            gray_224[-border:, :].flatten(),
+            gray_224[:, :border].flatten(),
+            gray_224[:, -border:].flatten(),
+        ])
+        bg_std = float(np.std(bg_px))
+        bg_uni = float(np.clip((40.0 - bg_std) / 32.0, 0.0, 1.0))
+
+        if face_bbox is not None and len(face_bbox) == 4:
+            f_ratio = float((face_bbox[2] * face_bbox[3]) / (h * w))
+        else:
+            f_ratio = 0.25
+
+        # 4. Color & Chromatic aberration
+        hsv = cv2.cvtColor(cv2.resize(proc, (224, 224)), cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1]
+        sat_m = float(np.mean(sat))
+        sat_s = float(np.std(sat))
+
+        qh, qw = proc.shape[0] // 4, proc.shape[1] // 4
+        corner = proc[:qh, :qw].astype(float)
+        cb, cg, cr = cv2.split(corner)
+        cgx_r = cv2.Sobel(cr, cv2.CV_64F, 1, 0)
+        cgx_b = cv2.Sobel(cb, cv2.CV_64F, 1, 0)
+        chroma_diff = float(np.mean(np.abs(cgx_r - cgx_b)))
+
+        # 5. Sparkle Watermark match
+        _, spk_score = self._detect_gemini_watermark(full_img)
+
+        # 6. Deep feature extraction from MobileNetV2 backbone
+        rgb_224 = cv2.cvtColor(cv2.resize(proc, (224, 224)), cv2.COLOR_BGR2RGB)
+        t = self.transform(rgb_224).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            feat = self.neural_model.spatial_backbone(t)
+            pooled = torch.nn.functional.adaptive_avg_pool2d(feat, (1, 1)).flatten().cpu().numpy()
+        deep_8 = pooled[::160][:8].tolist()
+
+        res_vec = [
+            noise_mean, noise_std, noise_skew, patch_min, patch_med,
+            corr_rb, corr_rg,
+            fft_z, fft_hf, oct1, oct2, oct3, oct4,
+            edge_dens, sobel_r, lap_var, bg_uni, f_ratio,
+            sat_m, sat_s, chroma_diff,
+            spk_score,
+            *deep_8
+        ]
+        return [0.0 if np.isnan(v) or np.isinf(v) else float(v) for v in res_vec]
+
     # ── Main analysis ───────────────────────────────────────────────────
     def analyze_crop(self, crop_rgb, crop_bgr, filename="",
                      original_bgr=None, face_bbox=None) -> Dict[str, Any]:
@@ -214,105 +340,56 @@ class VisualDetector(nn.Module):
         fname    = filename.lower()
         full_img = original_bgr if original_bgr is not None else crop_bgr
 
-        # ── Scene-level signals (use FULL original image) ─────────────────
-        full_noise   = self._camera_noise_floor(full_img)
-        edge_density = self._document_edge_density(full_img)
-        hf_power     = self._hf_power_ratio(full_img)
-        bg_uniformity = self._background_uniformity(full_img)
+        # ── Multi-domain feature extraction & ML inference (.pkl) ─────────
+        feat_vec = self._extract_feature_vector(crop_bgr, full_img, face_bbox)
 
-        # ── Face-crop artifact detectors ────────────────────────────────
-        fft_score, z_score = self._fft_anomaly_score(crop_bgr)
-        seam_score, seam_ratio = self._seam_score(crop_bgr)
-
-        # ── Watermark & signature detectors ─────────────────────────────
-        has_sparkle, sparkle_score = self._detect_gemini_watermark(full_img)
-
-        # ── Neural inference ────────────────────────────────────────────
-        try:
-            rgb_224 = cv2.resize(crop_rgb, (224, 224))
-            rgb_t   = self.transform(rgb_224).unsqueeze(0).to(self.device)
-            fft_t   = self._fft_tensor(crop_bgr).to(self.device)
-            hf_t    = torch.tensor([[hf_power]], dtype=torch.float32).to(self.device)
-            with torch.no_grad():
-                neural_score = float(self.neural_model(rgb_t, fft_t, hf_t).item())
-        except Exception:
-            neural_score = 0.50
-
-        # ── Decision Logic ──────────────────────────────────────────────
-        # 1. Physical document / printed ID card (DIU Student ID)
-        #    Dense text/barcode edges (> 0.30) + high sensor/halftone noise (> 5.0)
-        is_physical_doc = (edge_density > 0.30 and full_noise > 5.0) or (edge_density > 0.38)
-
-        # 2. GAN periodic checkerboard or face-swap seam
-        has_gan_artifact = (fft_score > 0.25 and z_score > 5.0) or (seam_score > 0.25)
-
-        # 3. Pure AI diffusion (ChatGPT / DALL-E / Gemini / Midjourney / SDXL)
-        #    Lack of physical CMOS sensor noise floor (< 1.85)
-        is_ai_diffusion = (full_noise < 1.85) and not is_physical_doc
-
-        # 4. AI studio headshot (clean background + low HF power)
-        is_ai_headshot = (
-            bg_uniformity > 0.55 and
-            hf_power < 0.18 and
-            full_noise < 2.5
-        ) and not is_physical_doc
-
-        # ── Branch selection ────────────────────────────────────────────
-        if has_sparkle:
-            raw_score    = 0.94
-            is_synthetic = True
-            reason       = "ai_watermark_gemini"
-
-        elif is_physical_doc:
-            raw_score    = min(neural_score * 0.25, 0.14)
-            is_synthetic = False
-            reason       = "physical_document"
-
-        elif has_gan_artifact:
-            raw_score    = max(0.88, neural_score)
-            is_synthetic = True
-            reason       = "gan_fft_or_seam"
-
-        elif is_ai_diffusion:
-            if full_noise < 1.15:
-                raw_score = 0.93
-            elif full_noise < 1.50:
-                raw_score = 0.88
-            else:
-                raw_score = 0.82
-            is_synthetic = True
-            reason       = "ai_diffusion_denoised"
-
-        elif is_ai_headshot:
-            raw_score    = float(np.clip(0.70 + 0.25 * bg_uniformity, 0.70, 0.92))
-            is_synthetic = True
-            reason       = "ai_headshot"
-
-        elif neural_score > 0.65:
-            raw_score    = 0.78
-            is_synthetic = True
-            reason       = "neural_model_synthetic"
-
-        elif full_noise >= 2.0:
-            raw_score    = float(np.clip(0.12 + 0.10 * neural_score, 0.08, 0.25))
-            is_synthetic = False
-            reason       = "authentic_camera_sensor"
-
+        if self.ml_classifier is not None and self.scaler is not None:
+            try:
+                x = np.nan_to_num(np.array([feat_vec], dtype=np.float32), nan=0.0)
+                x_scaled = self.scaler.transform(x)
+                ml_prob = float(self.ml_classifier.predict_proba(x_scaled)[0, 1])
+            except Exception:
+                ml_prob = 0.50
         else:
-            raw_score    = float(np.clip(0.50 * neural_score + 0.25 * fft_score + 0.25 * seam_score, 0.15, 0.85))
-            is_synthetic = raw_score > 0.55
-            reason       = "forensic_fallback"
+            ml_prob = 0.50
 
-        # ── Filename keyword override ────────────────────────────────────
+        # Filename override
         FAKE_KW = {'synthetic', 'deepfake', 'fake', 'gan', 'ai_face', 'midjourney',
                    'stablediffusion', 'voice_clone', 'generated', 'stylegan', 'sdxl'}
         REAL_KW = {'authentic', 'real_camera', 'photojournalist', 'raw_capture'}
         if any(k in fname for k in FAKE_KW):
-            raw_score = max(raw_score, 0.88)
+            final_score = max(ml_prob, 0.88)
         elif any(k in fname for k in REAL_KW):
-            raw_score = min(raw_score, 0.12)
+            final_score = min(ml_prob, 0.12)
+        else:
+            final_score = ml_prob
 
-        final_score = float(np.clip(raw_score, 0.05, 0.95))
+        final_score = float(np.clip(final_score, 0.05, 0.95))
+
+        # Forensic breakdown for Grad-CAM and explainability
+        full_noise    = feat_vec[0]
+        fft_z         = feat_vec[7]
+        hf_power      = feat_vec[8]
+        edge_density  = feat_vec[13]
+        bg_uniformity = feat_vec[16]
+        sparkle_score = feat_vec[21]
+
+        # Determine dominant forensic evidence that informed the ML model
+        if sparkle_score > 0.78:
+            reason = "ai_watermark_gemini"
+        elif edge_density > 0.30 and full_noise > 5.0:
+            reason = "physical_document"
+        elif full_noise < 1.85 and final_score > 0.50:
+            reason = "ai_diffusion_denoised"
+        elif fft_z > 5.0:
+            reason = "gan_fft_or_seam"
+        elif final_score > 0.50:
+            reason = "ml_classifier_synthetic"
+        else:
+            reason = "authentic_camera_sensor"
+
+        fft_score, z_score = self._fft_anomaly_score(crop_bgr)
+        seam_score, _ = self._seam_score(crop_bgr)
 
         return {
             "score":              float(round(final_score, 4)),
@@ -323,11 +400,11 @@ class VisualDetector(nn.Module):
             "hf_power_ratio":     float(round(hf_power, 4)),
             "edge_density":       float(round(edge_density, 4)),
             "bg_uniformity":      float(round(bg_uniformity, 4)),
-            "is_digital_graphic": bool(is_ai_diffusion or has_sparkle),
-            "is_physical_doc":    bool(is_physical_doc),
-            "is_ai_headshot":     bool(is_ai_headshot or is_ai_diffusion),
+            "is_digital_graphic": bool(final_score > 0.50),
+            "is_physical_doc":    bool(reason == "physical_document"),
+            "is_ai_headshot":     bool(final_score > 0.50 and full_noise < 2.0),
             "detection_reason":   reason,
-            "z_score":            float(round(z_score, 2)),
+            "z_score":            float(round(fft_z, 2)),
             "sparkle_score":      float(round(sparkle_score, 4)),
         }
 

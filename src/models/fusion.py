@@ -89,11 +89,11 @@ class MultimodalFusionEngine:
         final = round(float(np.clip(ws, 0.04, 0.97)), 4)
 
         # ── Verdict thresholds ───────────────────────────
-        if final > 0.65:
+        if final >= 0.52:
             verdict, color = "Likely Synthetic / Deepfake", "danger"
             summary = "Strong forensic evidence of artificial manipulation or neural generation."
             conf = round(final * 100.0, 1)
-        elif final <= 0.45:
+        elif final <= 0.42:
             verdict, color = "Authentic", "success"
             summary = "Media exhibits consistent organic biological and acoustic characteristics."
             conf = round((1.0 - final) * 100.0, 1)
