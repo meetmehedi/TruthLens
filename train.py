@@ -1,6 +1,6 @@
 import os
+import glob
 import time
-import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,18 +10,16 @@ import torchvision.transforms as transforms
 import numpy as np
 import cv2
 
-# Set random seeds for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-print(f"🚀 Training TruthLens Forensic Neural Models on: {device}")
+print(f"🚀 Training TruthLens on physical dataset using hardware: {device}")
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL DUAL-STREAM NEURAL NETWORK (Spatial MobileNetV2 + 2D-FFT Spectral)
+# 1. VISUAL DUAL-STREAM NEURAL NETWORK
 # -----------------------------------------------------------------------------
 class SpectralCNNBranch(nn.Module):
-    """Processes 2D-FFT magnitude power spectrum to capture GAN upsampling grids."""
     def __init__(self):
         super().__init__()
         self.conv = nn.Sequential(
@@ -41,18 +39,14 @@ class SpectralCNNBranch(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+
 class TruthLensVisualModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Spatial Stream: MobileNetV2
         mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
         self.spatial_backbone = mobilenet.features
         self.spatial_pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Spectral Stream: 2D-FFT CNN
         self.spectral_branch = SpectralCNNBranch()
-        
-        # Multimodal Classification Fusion Head (1280 spatial + 128 spectral = 1408)
         self.fusion_head = nn.Sequential(
             nn.Linear(1280 + 128, 256),
             nn.LayerNorm(256),
@@ -70,95 +64,70 @@ class TruthLensVisualModel(nn.Module):
         combined = torch.cat([spatial_feats, spectral_feats], dim=1)
         return self.fusion_head(combined)
 
+
 # -----------------------------------------------------------------------------
-# 2. SYNTHETIC & AUTHENTIC DATASET GENERATOR
+# 2. DISK-BACKED PHYSICAL DATASET LOADER
 # -----------------------------------------------------------------------------
-class ForensicFaceDataset(Dataset):
+class DiskForensicFaceDataset(Dataset):
     """
-    Generates realistic authentic human portraits and synthetic manipulated pairs:
-    - Authentic: Natural camera PRNU sensor noise, continuous organic skin micro-gradients.
-    - Deepfake Type 1: High-frequency 2D-FFT periodic lattice artifacts (GAN upsampling).
-    - Deepfake Type 2: Boundary seam feathering and edge blending warping (Face-swap).
-    - Deepfake Type 3: Latent diffusion smoothing with high-frequency attenuation.
+    Loads authentic and synthetic faces directly from the physical `data/` directory.
+    Extracts RGB spatial features and 2D-FFT frequency spectra for dual-stream training.
     """
-    def __init__(self, num_samples: int = 800):
-        self.num_samples = num_samples
+    def __init__(self, data_root: str = "data", split: str = "train", split_ratio: float = 0.8):
+        self.samples = []
+        real_files = sorted(glob.glob(os.path.join(data_root, "real_faces", "*.jpg")))
+        fake_files = sorted(glob.glob(os.path.join(data_root, "fake_faces", "*.jpg")))
+        
+        split_real = int(len(real_files) * split_ratio)
+        split_fake = int(len(fake_files) * split_ratio)
+        
+        if split == "train":
+            selected_real = real_files[:split_real]
+            selected_fake = fake_files[:split_fake]
+        else:
+            selected_real = real_files[split_real:]
+            selected_fake = fake_files[split_fake:]
+            
+        for path in selected_real:
+            self.samples.append((path, 0.0))
+        for path in selected_fake:
+            self.samples.append((path, 1.0))
+            
+        np.random.shuffle(self.samples)
+        
         self.transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
     def __len__(self):
-        return self.num_samples
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        is_synthetic = 1.0 if (idx % 2 == 1) else 0.0
+        path, label = self.samples[idx]
+        bgr = cv2.imread(path)
+        if bgr is None:
+            bgr = np.zeros((224, 224, 3), dtype=np.uint8)
+        bgr = cv2.resize(bgr, (224, 224))
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         
-        # Base face canvas (natural skin tones & lighting gradient)
-        h, w = 224, 224
-        img = np.zeros((h, w, 3), dtype=np.float32)
+        rgb_tensor = self.transform(rgb)
         
-        # Natural human skin tone baseline (warm melanin tone)
-        base_color = np.array([np.random.uniform(140, 220), np.random.uniform(110, 180), np.random.uniform(90, 150)], dtype=np.float32)
-        img[:, :] = base_color
-        
-        # Facial oval geometry
-        y, x = np.ogrid[:h, :w]
-        cy, cx = h // 2, w // 2
-        dist_sq = ((x - cx) ** 2) / (75 ** 2) + ((y - cy) ** 2) / (95 ** 2)
-        face_mask = dist_sq <= 1.0
-        
-        # Add facial features (eyes, eyebrows, mouth)
-        img[face_mask] *= np.random.uniform(0.9, 1.1)
-        # Eyes
-        img[75:90, 75:95] = [30, 25, 20]
-        img[75:90, 130:150] = [30, 25, 20]
-        # Mouth
-        img[150:165, 95:130] = [180, 60, 60]
-
-        if is_synthetic == 0.0:
-            # AUTHENTIC CHARACTERISTICS:
-            # 1. Natural camera sensor noise (PRNU Gaussian noise)
-            noise = np.random.normal(0, np.random.uniform(4, 9), (h, w, 3))
-            img = np.clip(img + noise, 0, 255)
-            # 2. Specular corneal reflection in pupils (biological liveness)
-            img[80:83, 83:86] = [255, 255, 255]
-            img[80:83, 138:141] = [255, 255, 255]
-        else:
-            # SYNTHETIC DEEPFAKE ARTIFACTS:
-            manipulation_type = idx % 3
-            if manipulation_type == 0:
-                # GAN Periodic Lattice Checkerboard (ConvTranspose2d upsampling artifact)
-                lattice = np.fromfunction(lambda i, j: np.sin(i * 0.9) * np.cos(j * 0.9) * 25.0, (h, w))
-                for c in range(3):
-                    img[:, :, c] = np.clip(img[:, :, c] + lattice, 0, 255)
-            elif manipulation_type == 1:
-                # Face-Swap Boundary Discontinuity (Paste / Seam feathering)
-                boundary_ring = (dist_sq >= 0.85) & (dist_sq <= 1.15)
-                img[boundary_ring] = cv2.GaussianBlur(img, (9, 9), 0)[boundary_ring] * 1.2
-            else:
-                # Diffusion Over-smoothing (Plastic skin with abrupt noise loss)
-                img = cv2.bilateralFilter(img.astype(np.uint8), 9, 75, 75).astype(np.float32)
-
-        img_u8 = np.clip(img, 0, 255).astype(np.uint8)
-        rgb_tensor = self.transform(cv2.cvtColor(img_u8, cv2.COLOR_BGR2RGB))
-        
-        # 2D-FFT Power Spectrum (112x112 normalized for spectral CNN)
-        gray = cv2.cvtColor(img_u8, cv2.COLOR_BGR2GRAY)
-        f = np.fft.fft2(cv2.resize(gray, (112, 112)))
-        fshift = np.fft.fftshift(f)
-        mag = 20 * np.log(np.abs(fshift) + 1e-6)
+        # Compute 2D-FFT magnitude spectrum
+        gray = cv2.cvtColor(cv2.resize(bgr, (112, 112)), cv2.COLOR_BGR2GRAY)
+        f = np.fft.fftshift(np.fft.fft2(gray.astype(np.float32)))
+        mag = 20 * np.log(np.abs(f) + 1e-6)
         mag_norm = (mag - np.mean(mag)) / (np.std(mag) + 1e-5)
         fft_tensor = torch.tensor(mag_norm, dtype=torch.float32).unsqueeze(0)
-
-        label_tensor = torch.tensor([is_synthetic], dtype=torch.float32)
+        label_tensor = torch.tensor([label], dtype=torch.float32)
+        
         return rgb_tensor, fft_tensor, label_tensor
 
+
 # -----------------------------------------------------------------------------
-# 3. ACOUSTIC VOCODER NEURAL NETWORK & DATASET
+# 3. DISK-BACKED AUDIO DATASET LOADER
 # -----------------------------------------------------------------------------
 class TruthLensAudioModel(nn.Module):
-    """Processes 128-band Log-Mel spectrograms to detect neural vocoder harmonic rigidity."""
     def __init__(self):
         super().__init__()
         self.conv = nn.Sequential(
@@ -182,64 +151,65 @@ class TruthLensAudioModel(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
-class ForensicAudioDataset(Dataset):
-    def __init__(self, num_samples: int = 500):
-        self.num_samples = num_samples
+
+class DiskAudioDataset(Dataset):
+    def __init__(self, data_root: str = "data", split: str = "train", split_ratio: float = 0.8):
+        import scipy.io.wavfile as wav
+        self.samples = []
+        real_wavs = sorted(glob.glob(os.path.join(data_root, "real_audio", "*.wav")))
+        fake_wavs = sorted(glob.glob(os.path.join(data_root, "fake_audio", "*.wav")))
+        
+        s_r = int(len(real_wavs) * split_ratio)
+        s_f = int(len(fake_wavs) * split_ratio)
+        
+        sel_r = real_wavs[:s_r] if split == "train" else real_wavs[s_r:]
+        sel_f = fake_wavs[:s_f] if split == "train" else fake_wavs[s_f:]
+        
+        for p in sel_r: self.samples.append((p, 0.0))
+        for p in sel_f: self.samples.append((p, 1.0))
+        np.random.shuffle(self.samples)
 
     def __len__(self):
-        return self.num_samples
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        is_synthetic = 1.0 if (idx % 2 == 1) else 0.0
-        # 128 bins x 128 frames spectrogram
-        spec = np.zeros((128, 128), dtype=np.float32)
-        
-        t = np.linspace(0, 1, 128)
-        if is_synthetic == 0.0:
-            # Authentic Human: Dynamic formants + natural vibrato / micro-tremors + broadband room noise
-            for f_idx in [25, 55, 85]:
-                jitter = np.sin(2 * np.pi * 5 * t + np.random.uniform(0, 6)) * 4
-                for col in range(128):
-                    bin_pos = int(np.clip(f_idx + jitter[col], 0, 127))
-                    spec[bin_pos, col] = 1.0
-            spec += np.random.normal(0.2, 0.08, (128, 128))
+        import scipy.io.wavfile as wav
+        p, label = self.samples[idx]
+        sr, sig = wav.read(p)
+        sig = sig.astype(np.float32) / 32768.0
+        # Compute STFT spectrogram (128x128)
+        if len(sig) < 16384:
+            sig = np.pad(sig, (0, 16384 - len(sig)))
         else:
-            # Synthetic / Cloned Speech: Rigid horizontal harmonic bands (Neural vocoder HiFi-GAN phase freeze)
-            for f_idx in [20, 40, 60, 80]:
-                spec[f_idx, :] = 1.2
-            # Sharp cutoff in top 25% frequencies (common 8kHz / 16kHz vocoder ceiling)
-            spec[96:, :] *= 0.02
-
+            sig = sig[:16384]
+        spec = np.abs(np.fft.rfft(sig.reshape(64, 256), axis=-1))
+        spec = cv2.resize(spec, (128, 128))
         spec_norm = (spec - np.mean(spec)) / (np.std(spec) + 1e-5)
-        spec_tensor = torch.tensor(spec_norm, dtype=torch.float32).unsqueeze(0)
-        label_tensor = torch.tensor([is_synthetic], dtype=torch.float32)
-        return spec_tensor, label_tensor
+        spec_t = torch.tensor(spec_norm, dtype=torch.float32).unsqueeze(0)
+        return spec_t, torch.tensor([label], dtype=torch.float32)
+
 
 # -----------------------------------------------------------------------------
-# 4. TRAINING EXECUTION PIPELINE
+# 4. TRAINING EXECUTION
 # -----------------------------------------------------------------------------
-def train_models():
+def train_all():
     os.makedirs("weights", exist_ok=True)
     
-    # --- TRAIN VISUAL DUAL-STREAM MODEL ---
-    print("\n--- [Phase 1/2] Training TruthLens Dual-Stream Visual Detector ---")
+    print("\n--- [Phase 1/2] Training Visual Detector on Physical Dataset ---")
+    train_ds = DiskForensicFaceDataset(split="train")
+    val_ds = DiskForensicFaceDataset(split="val")
+    print(f"Loaded {len(train_ds)} train samples and {len(val_ds)} validation samples.")
+    
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=16, shuffle=False)
+    
     visual_model = TruthLensVisualModel().to(device)
-    train_dataset = ForensicFaceDataset(num_samples=600)
-    val_dataset = ForensicFaceDataset(num_samples=200)
-    
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-    
     criterion = nn.BCELoss()
-    optimizer = optim.AdamW(visual_model.parameters(), lr=8e-4, weight_decay=1e-4)
+    optimizer = optim.AdamW(visual_model.parameters(), lr=1e-3, weight_decay=1e-4)
     
-    epochs = 4
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, 5):
         visual_model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        
+        total_loss, correct, total = 0.0, 0, 0
         for rgb, fft, labels in train_loader:
             rgb, fft, labels = rgb.to(device), fft.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -247,51 +217,39 @@ def train_models():
             loss = criterion(preds, labels)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item() * len(labels)
+            correct += ((preds >= 0.5) == (labels >= 0.5)).sum().item()
+            total += len(labels)
             
-            total_loss += loss.item() * rgb.size(0)
-            predicted_class = (preds > 0.5).float()
-            correct += (predicted_class == labels).sum().item()
-            total += labels.size(0)
-            
-        train_acc = (correct / total) * 100
-        
-        # Validation
         visual_model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
+        val_correct, val_total = 0, 0
         with torch.no_grad():
             for rgb, fft, labels in val_loader:
                 rgb, fft, labels = rgb.to(device), fft.to(device), labels.to(device)
                 preds = visual_model(rgb, fft)
-                loss = criterion(preds, labels)
-                val_loss += loss.item() * rgb.size(0)
-                predicted_class = (preds > 0.5).float()
-                val_correct += (predicted_class == labels).sum().item()
-                val_total += labels.size(0)
+                val_correct += ((preds >= 0.5) == (labels >= 0.5)).sum().item()
+                val_total += len(labels)
                 
-        val_acc = (val_correct / val_total) * 100
-        print(f"Epoch {epoch}/{epochs} | Train Loss: {total_loss/total:.4f} | Train Acc: {train_acc:.1f}% | Val Acc: {val_acc:.1f}%")
+        print(f"Visual Epoch [{epoch}/4] Loss: {total_loss/total:.4f} | Train Acc: {correct/total*100:.1f}% | Val Acc: {val_correct/max(val_total,1)*100:.1f}%")
         
-    torch.save(visual_model.state_dict(), "weights/truthlens_visual.pth")
-    print("✅ Successfully saved: weights/truthlens_visual.pth")
-
-    # --- TRAIN ACOUSTIC VOCODER MODEL ---
-    print("\n--- [Phase 2/2] Training TruthLens Acoustic Vocoder Detector ---")
+    visual_path = "weights/truthlens_visual.pth"
+    torch.save(visual_model.state_dict(), visual_path)
+    print(f"✅ Saved trained visual weights to {visual_path}")
+    
+    print("\n--- [Phase 2/2] Training Audio Detector on Physical Dataset ---")
+    train_audio_ds = DiskAudioDataset(split="train")
+    val_audio_ds = DiskAudioDataset(split="val")
+    print(f"Loaded {len(train_audio_ds)} audio train samples and {len(val_audio_ds)} validation samples.")
+    
+    audio_train_loader = DataLoader(train_audio_ds, batch_size=8, shuffle=True)
+    audio_val_loader = DataLoader(val_audio_ds, batch_size=8, shuffle=False)
+    
     audio_model = TruthLensAudioModel().to(device)
-    audio_train = ForensicAudioDataset(num_samples=400)
-    audio_val = ForensicAudioDataset(num_samples=100)
+    audio_opt = optim.Adam(audio_model.parameters(), lr=2e-3)
     
-    audio_train_loader = DataLoader(audio_train, batch_size=16, shuffle=True)
-    audio_val_loader = DataLoader(audio_val, batch_size=16, shuffle=False)
-    
-    audio_opt = optim.AdamW(audio_model.parameters(), lr=1e-3, weight_decay=1e-4)
-    
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, 5):
         audio_model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        total_loss, correct, total = 0.0, 0, 0
         for spec, labels in audio_train_loader:
             spec, labels = spec.to(device), labels.to(device)
             audio_opt.zero_grad()
@@ -299,27 +257,25 @@ def train_models():
             loss = criterion(preds, labels)
             loss.backward()
             audio_opt.step()
-            total_loss += loss.item() * spec.size(0)
-            correct += ((preds > 0.5).float() == labels).sum().item()
-            total += labels.size(0)
+            total_loss += loss.item() * len(labels)
+            correct += ((preds >= 0.5) == (labels >= 0.5)).sum().item()
+            total += len(labels)
             
-        train_acc = (correct / total) * 100
-        
         audio_model.eval()
-        val_correct = 0
-        val_total = 0
+        val_correct, val_total = 0, 0
         with torch.no_grad():
             for spec, labels in audio_val_loader:
                 spec, labels = spec.to(device), labels.to(device)
                 preds = audio_model(spec)
-                val_correct += ((preds > 0.5).float() == labels).sum().item()
-                val_total += labels.size(0)
-        val_acc = (val_correct / val_total) * 100
-        print(f"Epoch {epoch}/{epochs} | Audio Train Loss: {total_loss/total:.4f} | Audio Val Acc: {val_acc:.1f}%")
+                val_correct += ((preds >= 0.5) == (labels >= 0.5)).sum().item()
+                val_total += len(labels)
+                
+        print(f"Audio Epoch [{epoch}/4] Loss: {total_loss/total:.4f} | Train Acc: {correct/total*100:.1f}% | Val Acc: {val_correct/max(val_total,1)*100:.1f}%")
+        
+    audio_path = "weights/truthlens_audio.pth"
+    torch.save(audio_model.state_dict(), audio_path)
+    print(f"✅ Saved trained audio weights to {audio_path}")
 
-    torch.save(audio_model.state_dict(), "weights/truthlens_audio.pth")
-    print("✅ Successfully saved: weights/truthlens_audio.pth")
-    print("\n🎉 Both TruthLens Visual & Audio models have been trained and saved successfully!")
 
 if __name__ == "__main__":
-    train_models()
+    train_all()

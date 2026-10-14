@@ -88,7 +88,7 @@ class MultimodalFusionEngine:
             verdict, color = "Likely Synthetic / Deepfake", "danger"
             summary = "Strong forensic evidence of artificial manipulation or neural generation."
             conf = round(final * 100.0, 1)
-        elif final < 0.38:
+        elif final <= 0.45:
             verdict, color = "Authentic", "success"
             summary = "Media exhibits consistent organic biological and acoustic characteristics."
             conf = round((1.0 - final) * 100.0, 1)
