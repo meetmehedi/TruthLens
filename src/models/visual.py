@@ -149,18 +149,44 @@ class VisualDetector(nn.Module):
             neural_score = 0.50
 
         # 2. Calibrated Allied Decision Logic
-        if is_digital_render:
-            # AI-generated graphic (Midjourney, DALL-E, AI posters, digital synthetic faces)
-            raw_score = 0.88
+        # A physical printed/scanned document: high noise, no GAN artifacts, neural uncertain
+        is_printed_doc = noise_floor > 4.0 and fft_score < 0.20 and seam_score < 0.20 and neural_score < 0.75
+
+        # Zero-forensic-corroboration guard: neural fires but neither FFT nor seam agree → likely a real face
+        # that the model is uncertain about due to low-diversity training data
+        has_forensic_corroboration = (fft_score > 0.25) or (seam_score > 0.25)
+        neural_extreme = neural_score > 0.90  # only trust solo neural at very high confidence
+
+        if is_printed_doc:
+            # Physical document / scanned ID card protection
+            raw_score = min(neural_score * 0.40, 0.22)
+            is_synthetic = False
+        elif is_digital_render:
+            # Pure digital vector graphic or poster (no camera sensor noise)
+            raw_score = max(neural_score, 0.88)
             is_synthetic = True
-        elif neural_score > 0.50 or fft_score > 0.40 or seam_score > 0.40:
-            # Confirmed deepfake (Neural feature detection, GAN lattice, or Face-swap seam)
+        elif has_forensic_corroboration and neural_score > 0.55:
+            # GAN/diffusion confirmed by spectral OR seam artifacts + neural agreement
+            raw_score = 0.60 * neural_score + 0.25 * fft_score + 0.15 * seam_score
+            is_synthetic = True
+        elif neural_extreme and not is_printed_doc:
+            # Neural is extremely confident (>90%) even without forensic artifacts
+            # Still require noise_floor to be consistent with AI rendering (< 3.5)
+            if noise_floor < 3.8:
+                raw_score = neural_score * 0.90
+                is_synthetic = True
+            else:
+                # High noise floor suggests real camera — reduce false positive
+                raw_score = 0.50 * neural_score + 0.25 * fft_score + 0.25 * seam_score
+                is_synthetic = raw_score > 0.60
+        elif neural_score > 0.65 and has_forensic_corroboration:
+            # Medium-high neural with forensic support
             raw_score = max(neural_score, fft_score, seam_score)
             is_synthetic = True
         else:
-            # Genuine camera photo / student ID card / authentic selfie
-            raw_score = max(0.06, 0.60 * neural_score + 0.20 * fft_score + 0.20 * seam_score)
-            is_synthetic = False
+            # Genuine camera photo / authentic selfie — blend signals conservatively
+            raw_score = max(0.05, 0.55 * neural_score + 0.25 * fft_score + 0.20 * seam_score)
+            is_synthetic = raw_score > 0.58
 
         # Filename override only for explicit test dataset keywords
         FAKE_KEYWORDS = {'synthetic', 'deepfake', 'fake', 'gan', 'ai_face', 'midjourney',
